@@ -164,8 +164,8 @@ async def spawn_teammate_tool(
     plan_mode_required: bool = False,
     spawned_by: str = "team-lead",
 ) -> dict:
-    """Spawn a new teammate using any available backend. Any team member
-    (lead or teammate) can spawn sub-agents by setting spawned_by.
+    """Spawn a new teammate using any available backend. Set spawned_by
+    to attribute which team member initiated the spawn.
     Backends: claude-code, codex, gemini, opencode, aider. Models: use
     generic tiers (fast/balanced/powerful) or backend-specific names.
     Leave backend empty to use the default (claude-code if available).

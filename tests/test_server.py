@@ -1255,8 +1255,8 @@ class TestPeerToPeerMessaging:
                 "read_inbox", {"team_name": "test-team", "agent_name": "worker"}
             )
         )
-        lead_msgs = [m for m in inbox if m["from"] == "team-lead" and m["text"] == "hello"]
-        assert len(lead_msgs) == 1
+        default_sender_msgs = [m for m in inbox if m["from"] == "team-lead" and m["text"] == "hello"]
+        assert len(default_sender_msgs) == 1
 
     async def test_teammate_can_broadcast_to_other_teammates(self, team_client: Client):
         teams.add_member("test-team", _make_teammate("alice", "test-team"))
@@ -1300,8 +1300,8 @@ class TestPeerToPeerMessaging:
         assert not any(m["text"] == "team sync" for m in worker_inbox)
 
 
-class TestSubAgentSpawning:
-    async def test_teammate_can_spawn_sub_agent(self, client: Client):
+class TestTeammateSpawnAttribution:
+    async def test_teammate_can_spawn_with_attribution(self, client: Client):
         await client.call_tool("team_create", {"team_name": "sub-team"})
         # First spawn a parent teammate
         await client.call_tool(
