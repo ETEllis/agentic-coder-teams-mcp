@@ -10,6 +10,8 @@ from claude_teams.models import (
     ShutdownApproved,
     ShutdownRequest,
     SpawnResult,
+    SubAgent,
+    SubAgentConfig,
     TaskAssignment,
     TaskFile,
     TeamConfig,
@@ -326,3 +328,169 @@ class TestToolReturnModels:
         data = result.model_dump(exclude_none=True)
         assert "routing" not in data
         assert "request_id" not in data
+
+
+class TestSubAgentConfig:
+    def test_defaults(self):
+        config = SubAgentConfig()
+        assert config.enabled is True
+        assert config.max_sub_agents == 5
+        assert config.default_model == "fast"
+        assert "general-purpose" in config.allowed_types
+
+    def test_serializes_camel_case(self):
+        config = SubAgentConfig(max_sub_agents=3)
+        data = config.model_dump(by_alias=True)
+        assert data["maxSubAgents"] == 3
+        assert data["defaultModel"] == "fast"
+        assert data["allowedTypes"] == ["general-purpose", "code-reviewer", "research"]
+
+    def test_deserializes_from_camel_case(self):
+        raw = {
+            "enabled": False,
+            "maxSubAgents": 10,
+            "defaultModel": "balanced",
+            "allowedTypes": ["research"],
+        }
+        config = SubAgentConfig.model_validate(raw)
+        assert config.enabled is False
+        assert config.max_sub_agents == 10
+        assert config.default_model == "balanced"
+        assert config.allowed_types == ["research"]
+
+
+class TestSubAgent:
+    def test_serializes_with_camel_case(self):
+        sub = SubAgent(
+            agent_id="helper@team",
+            parent_name="worker",
+            team_name="team",
+            agent_type="code-reviewer",
+            task_id="task-123",
+            status="running",
+            created_at=1000,
+            process_handle="%5",
+            backend_type="claude-code",
+        )
+        data = sub.model_dump(by_alias=True)
+        assert data["agentId"] == "helper@team"
+        assert data["parentName"] == "worker"
+        assert data["agentType"] == "code-reviewer"
+        assert data["taskId"] == "task-123"
+        assert data["processHandle"] == "%5"
+        assert data["backendType"] == "claude-code"
+
+    def test_defaults(self):
+        sub = SubAgent(
+            agent_id="s@t",
+            parent_name="p",
+            team_name="t",
+        )
+        assert sub.agent_type == "general-purpose"
+        assert sub.status == "running"
+        assert sub.task_id == ""
+        assert sub.process_handle == ""
+
+    def test_round_trip(self):
+        sub = SubAgent(
+            agent_id="s@t",
+            parent_name="p",
+            team_name="t",
+            agent_type="research",
+            task_id="task-1",
+            prompt="analyze data",
+            status="completed",
+            created_at=1000,
+            process_handle="%10",
+            backend_type="claude-code",
+            model="haiku",
+        )
+        raw = json.loads(sub.model_dump_json(by_alias=True))
+        restored = SubAgent.model_validate(raw)
+        assert restored.agent_id == sub.agent_id
+        assert restored.status == "completed"
+        assert restored.model == "haiku"
+
+
+class TestTeammateMemberSubAgentFields:
+    def test_teammate_has_subagent_config(self):
+        mate = TeammateMember(
+            agent_id="w@t",
+            name="w",
+            agent_type="general-purpose",
+            model="sonnet",
+            prompt="p",
+            color="blue",
+            joined_at=0,
+            tmux_pane_id="%1",
+            cwd="/tmp",
+        )
+        assert mate.subagent_config.enabled is True
+        assert mate.subagent_config.max_sub_agents == 5
+        assert mate.sub_agents == []
+
+    def test_teammate_serializes_subagent_fields(self):
+        mate = TeammateMember(
+            agent_id="w@t",
+            name="w",
+            agent_type="general-purpose",
+            model="sonnet",
+            prompt="p",
+            color="blue",
+            joined_at=0,
+            tmux_pane_id="%1",
+            cwd="/tmp",
+            sub_agents=[
+                SubAgent(
+                    agent_id="s@t",
+                    parent_name="w",
+                    team_name="t",
+                    status="running",
+                )
+            ],
+        )
+        data = mate.model_dump(by_alias=True)
+        assert "subagentConfig" in data
+        assert data["subagentConfig"]["enabled"] is True
+        assert len(data["subAgents"]) == 1
+        assert data["subAgents"][0]["parentName"] == "w"
+
+    def test_teammate_round_trip_with_subagents(self):
+        mate = TeammateMember(
+            agent_id="w@t",
+            name="w",
+            agent_type="general-purpose",
+            model="sonnet",
+            prompt="p",
+            color="blue",
+            joined_at=0,
+            tmux_pane_id="%1",
+            cwd="/tmp",
+            subagent_config=SubAgentConfig(enabled=True, max_sub_agents=3),
+            sub_agents=[
+                SubAgent(
+                    agent_id="s1@t",
+                    parent_name="w",
+                    team_name="t",
+                    agent_type="research",
+                    task_id="task-1",
+                    status="running",
+                    created_at=1000,
+                ),
+                SubAgent(
+                    agent_id="s2@t",
+                    parent_name="w",
+                    team_name="t",
+                    agent_type="code-reviewer",
+                    task_id="task-2",
+                    status="completed",
+                    created_at=2000,
+                ),
+            ],
+        )
+        raw = json.loads(mate.model_dump_json(by_alias=True))
+        restored = TeammateMember.model_validate(raw)
+        assert restored.subagent_config.max_sub_agents == 3
+        assert len(restored.sub_agents) == 2
+        assert restored.sub_agents[0].agent_type == "research"
+        assert restored.sub_agents[1].status == "completed"

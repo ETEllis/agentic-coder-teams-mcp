@@ -82,6 +82,20 @@ class Backend(Protocol):
         """
         ...
 
+    @property
+    def supports_subagents(self) -> bool:
+        """Whether this backend supports spawning sub-agents.
+
+        Sub-agents are lightweight child agents spawned by a teammate via
+        the Task tool.  Interactive backends like claude-code support native
+        sub-agent spawning through sidechain sessions.  Non-interactive
+        backends delegate sub-agent management to the MCP server.
+
+        Returns:
+            bool: True if native sub-agent spawning is supported.
+        """
+        ...
+
     def retain_pane_after_exit(self, handle: str) -> None:
         """Keep the process pane alive after the command exits.
 
@@ -356,6 +370,19 @@ class BaseBackend:
 
         Returns:
             bool: False by default (one-shot / non-interactive).
+        """
+        return False
+
+    @property
+    def supports_subagents(self) -> bool:
+        """Whether this backend supports spawning sub-agents.
+
+        Most backends do not support native sub-agent spawning.
+        Subclasses with Task tool support (e.g., claude-code) should
+        override this to return ``True``.
+
+        Returns:
+            bool: False by default.
         """
         return False
 

@@ -41,6 +41,50 @@ class LeadMember(BaseModel):
     subscriptions: list = Field(default_factory=list)
 
 
+class SubAgentConfig(BaseModel):
+    """Configuration controlling a teammate's ability to spawn sub-agents.
+
+    Sub-agents are lightweight child agents scoped to a parent teammate.
+    They are architecturally distinct from teammates: sub-agents communicate
+    primarily with their parent, are cleaned up when the parent is removed,
+    and run as sidechain sessions rather than full team members.
+    """
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    enabled: bool = True
+    max_sub_agents: int = 5
+    default_model: str = "fast"
+    allowed_types: list[str] = Field(
+        default_factory=lambda: ["general-purpose", "code-reviewer", "research"]
+    )
+
+
+class SubAgent(BaseModel):
+    """A sub-agent spawned by a teammate via the Task tool or server.
+
+    Sub-agents differ from teammates:
+    - Scoped to a parent teammate (not a full team member)
+    - Communicate primarily with their parent
+    - Cleaned up when their parent teammate is removed
+    - Typically shorter-lived and task-specific
+    """
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    agent_id: str
+    parent_name: str
+    team_name: str
+    agent_type: str = "general-purpose"
+    task_id: str = ""
+    prompt: str = ""
+    status: Literal["running", "completed", "stopped", "failed"] = "running"
+    created_at: int = 0
+    process_handle: str = ""
+    backend_type: str = ""
+    model: str = ""
+
+
 class TeammateMember(BaseModel):
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
@@ -58,6 +102,8 @@ class TeammateMember(BaseModel):
     backend_type: str = "claude-code"
     is_active: bool = False
     process_handle: str = ""
+    subagent_config: SubAgentConfig = Field(default_factory=SubAgentConfig)
+    sub_agents: list[SubAgent] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

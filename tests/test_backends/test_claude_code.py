@@ -39,6 +39,10 @@ class TestClaudeCodeProperties:
         backend = ClaudeCodeBackend()
         assert backend.is_interactive is True
 
+    def test_supports_subagents(self):
+        backend = ClaudeCodeBackend()
+        assert backend.supports_subagents is True
+
 
 class TestClaudeCodeSupportedModels:
     def test_returns_expected_models(self):
