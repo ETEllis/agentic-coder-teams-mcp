@@ -4,7 +4,7 @@
 
 Multi-backend MCP server for orchestrating teams of agentic coding agents.
 
-**521 tests | 92% coverage | 17 backends | Python 3.12+**
+**555 tests | 92% coverage | 17 backends | 18 MCP tools | Python 3.12+**
 
 </div>
 
@@ -33,13 +33,14 @@ https://github.com/user-attachments/assets/531ada0a-6c36-45cd-8144-a092bb9f9a19
 
 Claude Code has a built-in [agent teams](https://code.claude.com/docs/en/agent-teams) feature that lets multiple Claude Code instances coordinate as a team with shared task lists, inter-agent messaging, and tmux-based spawning. But the protocol is internal and tightly coupled to Claude Code's own tooling.
 
-This MCP server reimplements that protocol as a standalone [Model Context Protocol](https://modelcontextprotocol.io/) server with one major addition: **pluggable backend support for 17 agentic coding CLIs**. Any MCP client can use it to spawn and coordinate heterogeneous teams of coding agents across different tools and providers.
+This MCP server reimplements that protocol as a standalone [Model Context Protocol](https://modelcontextprotocol.io/) server with two major additions: **pluggable backend support for 17 agentic coding CLIs** and **hierarchical sub-agent spawning**. Any MCP client can use it to spawn and coordinate heterogeneous teams of coding agents across different tools and providers.
 
 ### What you can do with it
 
 - Spawn a team of agents using different backends (Claude Code, Codex, Gemini, Aider, etc.)
 - Coordinate work through shared task lists with dependency tracking
-- Send messages between agents (direct, broadcast, shutdown requests)
+- Send messages between agents (direct, broadcast, shutdown requests) with flexible sender identity
+- Spawn lightweight sub-agents scoped to a parent teammate for parallel subtask execution
 - Monitor agent health and force-kill unresponsive agents
 - Use any MCP-compatible client as the orchestrator
 
@@ -51,10 +52,10 @@ This MCP server reimplements that protocol as a standalone [Model Context Protoc
 
 ```bash
 # Using uvx (recommended, no install needed)
-uvx --from git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp claude-teams serve
+uvx --from git+https://github.com/ETEllis/agentic-coder-teams-mcp claude-teams serve
 
 # Or clone and install locally
-git clone https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp.git
+git clone https://github.com/ETEllis/agentic-coder-teams-mcp.git
 cd agentic-coder-teams-mcp
 uv sync
 ```
@@ -90,7 +91,7 @@ Add to your project's `.mcp.json`:
   "mcpServers": {
     "claude-teams": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp", "claude-teams", "serve"]
+      "args": ["--from", "git+https://github.com/ETEllis/agentic-coder-teams-mcp", "claude-teams", "serve"]
     }
   }
 }
@@ -105,7 +106,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "claude-teams": {
       "type": "local",
-      "command": ["uvx", "--from", "git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp", "claude-teams", "serve"],
+      "command": ["uvx", "--from", "git+https://github.com/ETEllis/agentic-coder-teams-mcp", "claude-teams", "serve"],
       "enabled": true
     }
   }
@@ -117,7 +118,7 @@ Add to `~/.config/opencode/opencode.json`:
 The server speaks standard MCP over stdio. Point your client at:
 
 ```
-uvx --from git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp claude-teams serve
+uvx --from git+https://github.com/ETEllis/agentic-coder-teams-mcp claude-teams serve
 ```
 
 ---
@@ -182,7 +183,7 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 | Tool | Description |
 |------|-------------|
 | `spawn_teammate` | Spawn a coding agent via any backend. Specify backend, model, and prompt. |
-| `send_message` | Send direct messages, broadcasts, or shutdown/plan-approval responses. |
+| `send_message` | Send direct messages, broadcasts, or shutdown/plan-approval responses. Supports flexible sender identity. |
 | `read_inbox` | Read messages from an agent's inbox (with optional unread-only filter). |
 | `task_create` | Create a new task with auto-incrementing ID. |
 | `task_update` | Update task status, owner, dependencies, or metadata. |
@@ -197,6 +198,9 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 | `poll_inbox` | Long-poll an inbox for new messages (blocks up to 30 seconds). |
 | `process_shutdown_approved` | Cleanly remove a teammate after graceful shutdown approval. |
 | `health_check` | Check if a teammate's process is still running. |
+| `spawn_subagent` | Spawn a lightweight sub-agent scoped to a parent teammate. Inherits backend, supports type-based access control. |
+| `list_subagents` | List all sub-agents for a specific teammate with status and details. |
+| `stop_subagent` | Stop a running sub-agent by ID. Kills the process and updates status. |
 
 ---
 
@@ -250,10 +254,10 @@ Teammates launch as separate processes in tmux panes via `tmux split-window`. Ea
 
 ### Messaging
 
-JSON-based inboxes stored under `~/.claude/teams/<team>/inboxes/`. File locking via `fcntl.flock()` prevents corruption from concurrent reads and writes. Message types:
+JSON-based inboxes stored under `~/.claude/teams/<team>/inboxes/`. File locking via `fcntl.flock()` prevents corruption from concurrent reads and writes. Any team member (lead or teammate) can send messages by setting the `sender` field. Message types:
 
-- **Direct messages** -- one-to-one communication between agents
-- **Broadcasts** -- send to all teammates at once
+- **Direct messages** -- one-to-one communication between any agents (configurable sender)
+- **Broadcasts** -- send to all teammates except the sender
 - **Shutdown requests/responses** -- graceful shutdown protocol
 - **Plan approval** -- request and grant plan approval
 
@@ -266,6 +270,17 @@ JSON task files stored under `~/.claude/tasks/<team>/`. Tasks support:
 - Dependency graphs (`blocks` / `blockedBy`) with cycle detection
 - Arbitrary metadata
 - Auto-incrementing IDs
+
+### Sub-agents
+
+Sub-agents are lightweight child agents scoped to a parent teammate -- architecturally distinct from full teammates. They are designed for parallel subtask execution within a teammate's scope:
+
+- **Spawned by teammates** via `spawn_subagent`, inheriting the parent's backend by default
+- **Type-based access control** -- configurable allowed types (`general-purpose`, `code-reviewer`, `research`)
+- **Pool limits** -- max 5 running sub-agents per teammate (configurable via `SubAgentConfig`)
+- **Lifecycle management** -- cleaned up when the parent teammate is removed
+- **Communication** -- sub-agents get their own inbox and communicate primarily with their parent
+- **Result relay** -- non-interactive sub-agents automatically relay output to the parent's inbox
 
 ### Storage layout
 
@@ -296,9 +311,9 @@ JSON task files stored under `~/.claude/tasks/<team>/`. Tasks support:
 
 The server uses FastMCP's tag-based visibility system to progressively reveal tools as state evolves:
 
-1. **Cold start** -- only 4 bootstrap tools visible (~580 tokens vs ~4000 for all 15)
+1. **Cold start** -- only 4 bootstrap tools visible (~580 tokens vs ~5000 for all 18)
 2. **After `team_create`** -- 7 team-tier tools become visible
-3. **After first `spawn_teammate`** -- 4 teammate-tier tools become visible
+3. **After first `spawn_teammate`** -- 7 teammate-tier tools become visible (including sub-agent management)
 4. **After `team_delete`** -- resets back to bootstrap-only
 
 This is transparent to MCP clients -- the server sends `ToolListChangedNotification` automatically.
@@ -310,7 +325,7 @@ This is transparent to MCP clients -- the server sends `ToolListChangedNotificat
 ### Setup
 
 ```bash
-git clone https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp.git
+git clone https://github.com/ETEllis/agentic-coder-teams-mcp.git
 cd agentic-coder-teams-mcp
 uv sync
 ```
@@ -318,7 +333,7 @@ uv sync
 ### Running tests
 
 ```bash
-uv run pytest                           # Run all 521 tests
+uv run pytest                           # Run all 555 tests
 uv run pytest --cov=claude_teams        # With coverage
 uv run pytest tests/test_server.py -v   # Single module
 uv run pytest -k "test_spawn"           # Filter by name
@@ -336,9 +351,9 @@ uv run ty check                         # Type check (Astral's ty)
 
 ```
 src/claude_teams/
-├── server.py          # MCP server (FastMCP tools, progressive disclosure)
+├── server.py          # MCP server (FastMCP tools, progressive disclosure, sub-agent management)
 ├── cli.py             # Typer CLI commands
-├── models.py          # Pydantic models (TeamConfig, Task, InboxMessage, etc.)
+├── models.py          # Pydantic models (TeamConfig, Task, InboxMessage, SubAgent, etc.)
 ├── teams.py           # Team CRUD (config read/write, member management)
 ├── tasks.py           # Task CRUD (create, update, list, dependencies)
 ├── messaging.py       # Inbox operations (read, write, structured messages)
@@ -431,6 +446,7 @@ Backends implement a `Backend` protocol providing:
 - **Lifecycle**: `spawn`, `health_check`, `kill`, `graceful_shutdown`
 - **Interactivity**: `capture`, `send`, `wait_idle`, `execute_in_pane`
 - **Model resolution**: Map generic tiers (`fast`, `balanced`, `powerful`) to backend-specific model IDs
+- **Capability flags**: `is_interactive` (native messaging vs one-shot relay) and `supports_subagents` (native sub-agent spawning)
 
 A `BaseBackend` class provides shared tmux lifecycle management via [`claude-code-tools`](https://pypi.org/project/claude-code-tools/). Concrete backends only need to implement `build_command`, `build_env`, and model resolution.
 
@@ -444,7 +460,7 @@ The server is built on [FastMCP 3.0](https://github.com/jlowin/fastmcp) using:
 
 ### Message protocol
 
-Messages follow a structured format. The `send_message` tool supports five message types:
+Messages follow a structured format. The `send_message` tool supports five message types with a configurable `sender` field (defaults to `team-lead`), enabling peer-to-peer communication between any team members:
 
 | Type | Purpose | Required fields |
 |------|---------|----------------|
@@ -470,6 +486,16 @@ Transitions are validated -- you cannot go backwards (e.g., `in_progress` -> `pe
 - Team names must match `[a-zA-Z0-9_-]+` and be at most 64 characters
 - Agent names follow the same rules and `team-lead` is reserved
 - The `has_teammates` flag prevents redundant `enable_components` calls on subsequent spawns
+
+### Sub-agent architecture
+
+Sub-agents are architecturally distinct from teammates. While teammates are full team members registered in the team config, sub-agents are lightweight child agents scoped to a parent:
+
+- **Configuration**: Each teammate has a `SubAgentConfig` controlling `enabled`, `max_sub_agents` (default 5), `default_model`, and `allowed_types`
+- **Identity**: Sub-agents get IDs like `worker-1-sub-1234567890@team-name` and their own inbox
+- **Backend inheritance**: Sub-agents inherit their parent's backend unless explicitly overridden
+- **Result relay**: Non-interactive sub-agents automatically relay output to the parent teammate's inbox (not team-lead)
+- **Cleanup**: Sub-agents are tracked in the parent's `sub_agents` list and cleaned up when the parent is removed
 
 </details>
 
