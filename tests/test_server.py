@@ -1190,3 +1190,167 @@ class TestForceKillWithBackend:
             )
         )
         assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Inter-agent communication tests
+# ---------------------------------------------------------------------------
+
+
+class TestPeerToPeerMessaging:
+    async def test_teammate_can_send_message_to_another_teammate(
+        self, team_client: Client
+    ):
+        teams.add_member("test-team", _make_teammate("alice", "test-team"))
+        await team_client.call_tool(
+            "send_message",
+            {
+                "team_name": "test-team",
+                "type": "message",
+                "sender": "worker",
+                "recipient": "alice",
+                "content": "hey alice, need help",
+                "summary": "help request",
+            },
+        )
+        inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "alice"}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "worker"
+        assert inbox[0]["text"] == "hey alice, need help"
+
+    async def test_teammate_message_routing_includes_sender(self, team_client: Client):
+        teams.add_member("test-team", _make_teammate("bob", "test-team"))
+        result = _data(
+            await team_client.call_tool(
+                "send_message",
+                {
+                    "team_name": "test-team",
+                    "type": "message",
+                    "sender": "worker",
+                    "recipient": "bob",
+                    "content": "status update",
+                    "summary": "update",
+                },
+            )
+        )
+        assert result["routing"]["sender"] == "worker"
+
+    async def test_default_sender_is_team_lead(self, team_client: Client):
+        await team_client.call_tool(
+            "send_message",
+            {
+                "team_name": "test-team",
+                "type": "message",
+                "recipient": "worker",
+                "content": "hello",
+                "summary": "greeting",
+            },
+        )
+        inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "worker"}
+            )
+        )
+        lead_msgs = [m for m in inbox if m["from"] == "team-lead" and m["text"] == "hello"]
+        assert len(lead_msgs) == 1
+
+    async def test_teammate_can_broadcast_to_other_teammates(self, team_client: Client):
+        teams.add_member("test-team", _make_teammate("alice", "test-team"))
+        teams.add_member("test-team", _make_teammate("bob", "test-team"))
+        result = _data(
+            await team_client.call_tool(
+                "send_message",
+                {
+                    "team_name": "test-team",
+                    "type": "broadcast",
+                    "sender": "worker",
+                    "content": "team sync",
+                    "summary": "sync",
+                },
+            )
+        )
+        # broadcast excludes sender, so alice and bob should get it but not worker
+        assert result["message"] == "Broadcast sent to 2 teammate(s)"
+
+        alice_inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "alice"}
+            )
+        )
+        assert any(m["from"] == "worker" and m["text"] == "team sync" for m in alice_inbox)
+
+        bob_inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "bob"}
+            )
+        )
+        assert any(m["from"] == "worker" and m["text"] == "team sync" for m in bob_inbox)
+
+        # worker should NOT receive their own broadcast
+        worker_inbox = _data(
+            await team_client.call_tool(
+                "read_inbox",
+                {"team_name": "test-team", "agent_name": "worker", "unread_only": True},
+            )
+        )
+        assert not any(m["text"] == "team sync" for m in worker_inbox)
+
+
+class TestSubAgentSpawning:
+    async def test_teammate_can_spawn_sub_agent(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sub-team"})
+        # First spawn a parent teammate
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "sub-team",
+                "name": "parent",
+                "prompt": "be the parent",
+            },
+        )
+        # Parent spawns a sub-agent
+        result = _data(
+            await client.call_tool(
+                "spawn_teammate",
+                {
+                    "team_name": "sub-team",
+                    "name": "child",
+                    "prompt": "help your parent",
+                    "spawned_by": "parent",
+                },
+            )
+        )
+        assert result["name"] == "child"
+        assert result["team_name"] == "sub-team"
+
+        # Child's inbox should show the prompt came from parent
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox", {"team_name": "sub-team", "agent_name": "child"}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "parent"
+        assert inbox[0]["text"] == "help your parent"
+
+    async def test_default_spawned_by_is_team_lead(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "lead-spawn"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "lead-spawn",
+                "name": "worker",
+                "prompt": "do work",
+            },
+        )
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox", {"team_name": "lead-spawn", "agent_name": "worker"}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "team-lead"

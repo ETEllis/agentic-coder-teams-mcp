@@ -161,11 +161,13 @@ async def spawn_teammate_tool(
     backend: str = "",
     subagent_type: str = "general-purpose",
     plan_mode_required: bool = False,
+    spawned_by: str = "team-lead",
 ) -> dict:
-    """Spawn a new teammate using any available backend. Backends: claude-code,
-    codex, gemini, opencode, aider. Models: use generic tiers
-    (fast/balanced/powerful) or backend-specific names. Leave backend empty to
-    use the default (claude-code if available).
+    """Spawn a new teammate using any available backend. Any team member
+    (lead or teammate) can spawn sub-agents by setting spawned_by.
+    Backends: claude-code, codex, gemini, opencode, aider. Models: use
+    generic tiers (fast/balanced/powerful) or backend-specific names.
+    Leave backend empty to use the default (claude-code if available).
     """
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
@@ -230,7 +232,7 @@ async def spawn_teammate_tool(
     # Send initial prompt via inbox
     messaging.ensure_inbox(team_name, name)
     initial_msg = InboxMessage(
-        from_="team-lead",
+        from_=spawned_by,
         text=prompt,
         timestamp=messaging.now_iso(),
         read=False,
@@ -323,8 +325,10 @@ def send_message(
     sender: str = "team-lead",
 ) -> dict:
     """Send a message to a teammate or respond to a protocol request.
+    Any team member (lead or teammate) can send messages by setting
+    the sender field.
     Type 'message' sends a direct message (requires recipient, summary).
-    Type 'broadcast' sends to all teammates (requires summary).
+    Type 'broadcast' sends to all teammates except the sender (requires summary).
     Type 'shutdown_request' asks a teammate to shut down (requires recipient; content used as reason).
     Type 'shutdown_response' responds to a shutdown request (requires sender, request_id, approve).
     Type 'plan_approval_response' responds to a plan approval request (requires recipient, request_id, approve).
@@ -350,7 +354,7 @@ def send_message(
                 break
         messaging.send_plain_message(
             team_name,
-            "team-lead",
+            sender,
             recipient,
             content,
             summary=summary,
@@ -360,7 +364,7 @@ def send_message(
             success=True,
             message=f"Message sent to {recipient}",
             routing={
-                "sender": "team-lead",
+                "sender": sender,
                 "target": recipient,
                 "targetColor": target_color,
                 "summary": summary,
@@ -374,10 +378,10 @@ def send_message(
         config = teams.read_config(team_name)
         count = 0
         for member in config.members:
-            if isinstance(member, TeammateMember):
+            if isinstance(member, TeammateMember) and member.name != sender:
                 messaging.send_plain_message(
                     team_name,
-                    "team-lead",
+                    sender,
                     member.name,
                     content,
                     summary=summary,
