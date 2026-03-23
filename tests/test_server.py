@@ -1190,3 +1190,484 @@ class TestForceKillWithBackend:
             )
         )
         assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Inter-agent communication tests
+# ---------------------------------------------------------------------------
+
+
+class TestPeerToPeerMessaging:
+    async def test_teammate_can_send_message_to_another_teammate(
+        self, team_client: Client
+    ):
+        teams.add_member("test-team", _make_teammate("alice", "test-team"))
+        await team_client.call_tool(
+            "send_message",
+            {
+                "team_name": "test-team",
+                "type": "message",
+                "sender": "worker",
+                "recipient": "alice",
+                "content": "hey alice, need help",
+                "summary": "help request",
+            },
+        )
+        inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "alice"}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "worker"
+        assert inbox[0]["text"] == "hey alice, need help"
+
+    async def test_teammate_message_routing_includes_sender(self, team_client: Client):
+        teams.add_member("test-team", _make_teammate("bob", "test-team"))
+        result = _data(
+            await team_client.call_tool(
+                "send_message",
+                {
+                    "team_name": "test-team",
+                    "type": "message",
+                    "sender": "worker",
+                    "recipient": "bob",
+                    "content": "status update",
+                    "summary": "update",
+                },
+            )
+        )
+        assert result["routing"]["sender"] == "worker"
+
+    async def test_default_sender_is_team_lead(self, team_client: Client):
+        await team_client.call_tool(
+            "send_message",
+            {
+                "team_name": "test-team",
+                "type": "message",
+                "recipient": "worker",
+                "content": "hello",
+                "summary": "greeting",
+            },
+        )
+        inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "worker"}
+            )
+        )
+        default_sender_msgs = [m for m in inbox if m["from"] == "team-lead" and m["text"] == "hello"]
+        assert len(default_sender_msgs) == 1
+
+    async def test_teammate_can_broadcast_to_other_teammates(self, team_client: Client):
+        teams.add_member("test-team", _make_teammate("alice", "test-team"))
+        teams.add_member("test-team", _make_teammate("bob", "test-team"))
+        result = _data(
+            await team_client.call_tool(
+                "send_message",
+                {
+                    "team_name": "test-team",
+                    "type": "broadcast",
+                    "sender": "worker",
+                    "content": "team sync",
+                    "summary": "sync",
+                },
+            )
+        )
+        # broadcast excludes sender, so alice and bob should get it but not worker
+        assert result["message"] == "Broadcast sent to 2 teammate(s)"
+
+        alice_inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "alice"}
+            )
+        )
+        assert any(m["from"] == "worker" and m["text"] == "team sync" for m in alice_inbox)
+
+        bob_inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": "bob"}
+            )
+        )
+        assert any(m["from"] == "worker" and m["text"] == "team sync" for m in bob_inbox)
+
+        # worker should NOT receive their own broadcast
+        worker_inbox = _data(
+            await team_client.call_tool(
+                "read_inbox",
+                {"team_name": "test-team", "agent_name": "worker", "unread_only": True},
+            )
+        )
+        assert not any(m["text"] == "team sync" for m in worker_inbox)
+
+
+class TestTeammateSpawnAttribution:
+    async def test_teammate_can_spawn_with_attribution(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sub-team"})
+        # First spawn a parent teammate
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "sub-team",
+                "name": "parent",
+                "prompt": "be the parent",
+            },
+        )
+        # Parent spawns a sub-agent
+        result = _data(
+            await client.call_tool(
+                "spawn_teammate",
+                {
+                    "team_name": "sub-team",
+                    "name": "child",
+                    "prompt": "help your parent",
+                    "spawned_by": "parent",
+                },
+            )
+        )
+        assert result["name"] == "child"
+        assert result["team_name"] == "sub-team"
+
+        # Child's inbox should show the prompt came from parent
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox", {"team_name": "sub-team", "agent_name": "child"}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "parent"
+        assert inbox[0]["text"] == "help your parent"
+
+    async def test_default_spawned_by_is_team_lead(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "lead-spawn"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "lead-spawn",
+                "name": "worker",
+                "prompt": "do work",
+            },
+        )
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox", {"team_name": "lead-spawn", "agent_name": "worker"}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "team-lead"
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent tests (architecturally distinct from teammates)
+# ---------------------------------------------------------------------------
+
+
+class TestSubAgentSpawning:
+    async def test_teammate_can_spawn_subagent(self, team_client: Client):
+        result = _data(
+            await team_client.call_tool(
+                "spawn_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "prompt": "analyze this file",
+                    "agent_type": "general-purpose",
+                },
+            )
+        )
+        assert result["parent"] == "worker"
+        assert result["status"] == "running"
+        assert result["agent_type"] == "general-purpose"
+        assert "agent_id" in result
+        assert "task_id" in result
+
+    async def test_subagent_prompt_sent_from_parent(self, team_client: Client):
+        result = _data(
+            await team_client.call_tool(
+                "spawn_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "prompt": "do sub-task",
+                },
+            )
+        )
+        # Extract sub-agent name from agent_id
+        sub_name = result["agent_id"].split("@")[0]
+        inbox = _data(
+            await team_client.call_tool(
+                "read_inbox", {"team_name": "test-team", "agent_name": sub_name}
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "worker"
+        assert inbox[0]["text"] == "do sub-task"
+
+    async def test_subagent_tracked_in_parent_config(self, team_client: Client):
+        await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "sub-task",
+            },
+        )
+        config = _data(
+            await team_client.call_tool("read_config", {"team_name": "test-team"})
+        )
+        worker = None
+        for member in config["members"]:
+            if member.get("name") == "worker":
+                worker = member
+                break
+        assert worker is not None
+        assert len(worker["subAgents"]) == 1
+        assert worker["subAgents"][0]["parentName"] == "worker"
+        assert worker["subAgents"][0]["status"] == "running"
+
+    async def test_subagent_rejects_disabled_config(self, team_client: Client):
+        # Disable sub-agent spawning for the worker
+        config = teams.read_config("test-team")
+        for member in config.members:
+            if isinstance(member, TeammateMember) and member.name == "worker":
+                member.subagent_config.enabled = False
+                break
+        teams.write_config("test-team", config)
+
+        result = await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "blocked",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "disabled" in _text(result).lower()
+
+    async def test_subagent_rejects_disallowed_type(self, team_client: Client):
+        result = await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "bad type",
+                "agent_type": "hacker",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not allowed" in _text(result).lower()
+
+    async def test_subagent_respects_max_limit(self, team_client: Client):
+        # Set max_sub_agents to 1
+        config = teams.read_config("test-team")
+        for member in config.members:
+            if isinstance(member, TeammateMember) and member.name == "worker":
+                member.subagent_config.max_sub_agents = 1
+                break
+        teams.write_config("test-team", config)
+
+        # First spawn should succeed
+        await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "first sub",
+            },
+        )
+
+        # Second spawn should fail
+        result = await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "second sub",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "maximum" in _text(result).lower()
+
+    async def test_subagent_with_custom_name(self, team_client: Client):
+        result = _data(
+            await team_client.call_tool(
+                "spawn_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "prompt": "named sub",
+                    "name": "my-helper",
+                },
+            )
+        )
+        assert result["agent_id"] == "my-helper@test-team"
+
+
+class TestSubAgentListing:
+    async def test_list_empty_subagents(self, team_client: Client):
+        result = _data(
+            await team_client.call_tool(
+                "list_subagents",
+                {"team_name": "test-team", "parent_name": "worker"},
+            )
+        )
+        assert result == []
+
+    async def test_list_after_spawn(self, team_client: Client):
+        await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "task A",
+            },
+        )
+        await team_client.call_tool(
+            "spawn_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "prompt": "task B",
+            },
+        )
+        result = _data(
+            await team_client.call_tool(
+                "list_subagents",
+                {"team_name": "test-team", "parent_name": "worker"},
+            )
+        )
+        assert len(result) == 2
+        assert all(sub["parentName"] == "worker" for sub in result)
+
+    async def test_list_rejects_nonexistent_teammate(self, team_client: Client):
+        result = await team_client.call_tool(
+            "list_subagents",
+            {"team_name": "test-team", "parent_name": "ghost"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "ghost" in _text(result)
+
+
+class TestSubAgentStopping:
+    async def test_stop_running_subagent(self, team_client: Client):
+        spawn_result = _data(
+            await team_client.call_tool(
+                "spawn_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "prompt": "stoppable",
+                },
+            )
+        )
+        sub_id = spawn_result["agent_id"]
+
+        result = _data(
+            await team_client.call_tool(
+                "stop_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "sub_agent_id": sub_id,
+                },
+            )
+        )
+        assert result["success"] is True
+
+        # Verify status updated
+        subs = _data(
+            await team_client.call_tool(
+                "list_subagents",
+                {"team_name": "test-team", "parent_name": "worker"},
+            )
+        )
+        stopped = [s for s in subs if s["agentId"] == sub_id]
+        assert len(stopped) == 1
+        assert stopped[0]["status"] == "stopped"
+
+    async def test_stop_nonexistent_subagent(self, team_client: Client):
+        result = await team_client.call_tool(
+            "stop_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "sub_agent_id": "fake@test-team",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not found" in _text(result).lower()
+
+    async def test_stop_already_stopped_subagent(self, team_client: Client):
+        spawn_result = _data(
+            await team_client.call_tool(
+                "spawn_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "prompt": "double stop",
+                },
+            )
+        )
+        sub_id = spawn_result["agent_id"]
+
+        # Stop once
+        await team_client.call_tool(
+            "stop_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "sub_agent_id": sub_id,
+            },
+        )
+
+        # Stop again should fail
+        result = await team_client.call_tool(
+            "stop_subagent",
+            {
+                "team_name": "test-team",
+                "parent_name": "worker",
+                "sub_agent_id": sub_id,
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not running" in _text(result).lower()
+
+
+class TestSubAgentProgressiveDisclosure:
+    async def test_subagent_tools_visible_after_spawn(self, team_client: Client):
+        tool_list = await team_client.list_tools()
+        names = {t.name for t in tool_list}
+        assert "spawn_subagent" in names
+        assert "list_subagents" in names
+        assert "stop_subagent" in names
+
+    async def test_subagent_tools_not_visible_before_teammate_spawn(
+        self, client: Client
+    ):
+        await client.call_tool("team_create", {"team_name": "vis-sub"})
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        assert "spawn_subagent" not in names
+        assert "list_subagents" not in names
+        assert "stop_subagent" not in names
+
+
+class TestSubAgentBackendAwareness:
+    async def test_subagent_reports_native_support(self, team_client: Client):
+        result = _data(
+            await team_client.call_tool(
+                "spawn_subagent",
+                {
+                    "team_name": "test-team",
+                    "parent_name": "worker",
+                    "prompt": "check support",
+                },
+            )
+        )
+        assert "supports_native_subagents" in result

@@ -16,6 +16,18 @@ class ClaudeCodeBackend(BaseBackend):
         """
         return True
 
+    @property
+    def supports_subagents(self) -> bool:
+        """Claude Code supports native sub-agent spawning via the Task tool.
+
+        When enabled, Claude Code can spawn sidechain sessions as lightweight
+        sub-agents that run in parallel and communicate via hooks.
+
+        Returns:
+            bool: Always True.
+        """
+        return True
+
     _MODEL_MAP: dict[str, str] = {
         "fast": "haiku",
         "balanced": "sonnet",

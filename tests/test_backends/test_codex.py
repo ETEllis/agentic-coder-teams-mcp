@@ -38,6 +38,10 @@ class TestCodexProperties:
         backend = CodexBackend()
         assert backend.is_interactive is False
 
+    def test_does_not_support_subagents(self):
+        backend = CodexBackend()
+        assert backend.supports_subagents is False
+
 
 class TestCodexSupportedModels:
     def test_returns_expected_models(self):

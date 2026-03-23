@@ -24,6 +24,7 @@ from claude_teams.models import (
     SendMessageResult,
     ShutdownApproved,
     SpawnResult,
+    SubAgent,
     TeammateMember,
 )
 from claude_teams.spawner import assign_color
@@ -161,11 +162,13 @@ async def spawn_teammate_tool(
     backend: str = "",
     subagent_type: str = "general-purpose",
     plan_mode_required: bool = False,
+    spawned_by: str = "team-lead",
 ) -> dict:
-    """Spawn a new teammate using any available backend. Backends: claude-code,
-    codex, gemini, opencode, aider. Models: use generic tiers
-    (fast/balanced/powerful) or backend-specific names. Leave backend empty to
-    use the default (claude-code if available).
+    """Spawn a new teammate using any available backend. Set spawned_by
+    to attribute which team member initiated the spawn.
+    Backends: claude-code, codex, gemini, opencode, aider. Models: use
+    generic tiers (fast/balanced/powerful) or backend-specific names.
+    Leave backend empty to use the default (claude-code if available).
     """
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
@@ -230,7 +233,7 @@ async def spawn_teammate_tool(
     # Send initial prompt via inbox
     messaging.ensure_inbox(team_name, name)
     initial_msg = InboxMessage(
-        from_="team-lead",
+        from_=spawned_by,
         text=prompt,
         timestamp=messaging.now_iso(),
         read=False,
@@ -323,8 +326,10 @@ def send_message(
     sender: str = "team-lead",
 ) -> dict:
     """Send a message to a teammate or respond to a protocol request.
+    Any team member (lead or teammate) can send messages by setting
+    the sender field.
     Type 'message' sends a direct message (requires recipient, summary).
-    Type 'broadcast' sends to all teammates (requires summary).
+    Type 'broadcast' sends to all teammates except the sender (requires summary).
     Type 'shutdown_request' asks a teammate to shut down (requires recipient; content used as reason).
     Type 'shutdown_response' responds to a shutdown request (requires sender, request_id, approve).
     Type 'plan_approval_response' responds to a plan approval request (requires recipient, request_id, approve).
@@ -350,7 +355,7 @@ def send_message(
                 break
         messaging.send_plain_message(
             team_name,
-            "team-lead",
+            sender,
             recipient,
             content,
             summary=summary,
@@ -360,7 +365,7 @@ def send_message(
             success=True,
             message=f"Message sent to {recipient}",
             routing={
-                "sender": "team-lead",
+                "sender": sender,
                 "target": recipient,
                 "targetColor": target_color,
                 "summary": summary,
@@ -374,10 +379,10 @@ def send_message(
         config = teams.read_config(team_name)
         count = 0
         for member in config.members:
-            if isinstance(member, TeammateMember):
+            if isinstance(member, TeammateMember) and member.name != sender:
                 messaging.send_plain_message(
                     team_name,
-                    "team-lead",
+                    sender,
                     member.name,
                     content,
                     summary=summary,
@@ -630,10 +635,21 @@ def _resolve_teammate(
 
 @mcp.tool(tags={_TAG_TEAMMATE})
 def force_kill_teammate(team_name: str, agent_name: str) -> dict:
-    """Forcibly kill a teammate. Uses the teammate's registered backend to
-    perform the kill. Removes member from config and resets their tasks.
+    """Forcibly kill a teammate and all its sub-agents. Uses the teammate's
+    registered backend to perform the kill. Removes member from config and
+    resets their tasks.
     """
-    _member, process_handle, backend_type = _resolve_teammate(team_name, agent_name)
+    member, process_handle, backend_type = _resolve_teammate(team_name, agent_name)
+
+    # Kill all sub-agents first
+    if isinstance(member, TeammateMember) and member.sub_agents:
+        for sub in member.sub_agents:
+            if sub.status == "running" and sub.process_handle:
+                try:
+                    sub_backend = registry.get(sub.backend_type or backend_type)
+                    sub_backend.kill(sub.process_handle)
+                except (KeyError, Exception):
+                    pass
 
     if process_handle:
         try:
@@ -728,6 +744,350 @@ def health_check(team_name: str, agent_name: str, ctx: Context) -> dict:
         "backend": backend_type,
         "detail": status.detail,
     }
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent tools (distinct from teammate management)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(tags={_TAG_TEAMMATE})
+async def spawn_subagent(
+    team_name: str,
+    parent_name: str,
+    prompt: str,
+    ctx: Context,
+    agent_type: str = "general-purpose",
+    model: str = "fast",
+    backend: str = "",
+    name: str = "",
+) -> dict:
+    """Spawn a sub-agent for a teammate. Sub-agents are lightweight child
+    agents scoped to their parent — architecturally distinct from teammates.
+    They communicate with their parent via inbox, are cleaned up when the
+    parent is removed, and are tracked in the parent's sub_agents list.
+    """
+    ls = _get_lifespan(ctx)
+    reg = ls["registry"]
+
+    # Resolve parent teammate
+    parent, _parent_handle, parent_backend_type = _resolve_teammate(
+        team_name, parent_name
+    )
+    if not isinstance(parent, TeammateMember):
+        raise ToolError(f"{parent_name!r} is not a teammate")
+
+    # Check sub-agent config
+    sac = parent.subagent_config
+    if not sac.enabled:
+        raise ToolError(f"Sub-agent spawning is disabled for {parent_name!r}")
+    if agent_type not in sac.allowed_types:
+        raise ToolError(
+            f"Agent type {agent_type!r} not allowed for {parent_name!r}. "
+            f"Allowed: {sac.allowed_types}"
+        )
+    running = [s for s in parent.sub_agents if s.status == "running"]
+    if len(running) >= sac.max_sub_agents:
+        raise ToolError(
+            f"{parent_name!r} has reached the maximum of {sac.max_sub_agents} "
+            f"running sub-agents"
+        )
+
+    # Resolve backend (inherit from parent if not specified)
+    if backend:
+        try:
+            backend_obj = reg.get(backend)
+        except KeyError as exc:
+            raise ToolError(str(exc))
+    else:
+        try:
+            backend_obj = reg.get(parent_backend_type)
+        except (KeyError, RuntimeError) as exc:
+            raise ToolError(str(exc))
+
+    # Resolve model
+    resolved_model = model
+    try:
+        resolved_model = backend_obj.resolve_model(model)
+    except ValueError as exc:
+        raise ToolError(str(exc))
+
+    # Generate sub-agent identity
+    now_ms = int(time.time() * 1000)
+    sub_name = name or f"{parent_name}-sub-{now_ms}"
+    sub_id = f"{sub_name}@{team_name}"
+    task_id = f"task-{now_ms}"
+
+    # Create sub-agent record
+    sub = SubAgent(
+        agent_id=sub_id,
+        parent_name=parent_name,
+        team_name=team_name,
+        agent_type=agent_type,
+        task_id=task_id,
+        prompt=prompt,
+        status="running",
+        created_at=now_ms,
+        backend_type=backend_obj.name,
+        model=resolved_model,
+    )
+
+    # Set up inbox and send initial prompt from parent
+    messaging.ensure_inbox(team_name, sub_name)
+    initial_msg = InboxMessage(
+        from_=parent_name,
+        text=prompt,
+        timestamp=messaging.now_iso(),
+        read=False,
+    )
+    messaging.append_message(team_name, sub_name, initial_msg)
+
+    # Spawn via backend
+    cwd = parent.cwd
+    extra: dict[str, str] | None = None
+    one_shot_result_path: Path | None = None
+
+    if backend_obj.name == "codex":
+        one_shot_result_path = _create_one_shot_result_path(team_name, sub_name)
+        extra = {"output_last_message_path": str(one_shot_result_path)}
+
+    request = SpawnRequest(
+        agent_id=sub_id,
+        name=sub_name,
+        team_name=team_name,
+        prompt=prompt,
+        model=resolved_model,
+        agent_type=agent_type,
+        color=parent.color,
+        cwd=cwd,
+        lead_session_id=ls["session_id"],
+        plan_mode_required=False,
+        extra=extra,
+    )
+    try:
+        spawn_result = backend_obj.spawn(request)
+    except Exception as exc:
+        raise ToolError(f"Sub-agent spawn failed: {exc}")
+
+    sub.process_handle = spawn_result.process_handle
+
+    # Register sub-agent under parent in team config
+    config = teams.read_config(team_name)
+    for member in config.members:
+        if isinstance(member, TeammateMember) and member.name == parent_name:
+            member.sub_agents.append(sub)
+            break
+    teams.write_config(team_name, config)
+
+    # Start result relay for non-interactive backends
+    if not backend_obj.is_interactive:
+        try:
+            backend_obj.retain_pane_after_exit(spawn_result.process_handle)
+        except Exception:
+            logger.debug(
+                "Failed to set remain-on-exit for sub-agent %s", sub_name, exc_info=True
+            )
+        relay_task = asyncio.create_task(
+            _relay_subagent_result(
+                team_name=team_name,
+                parent_name=parent_name,
+                sub_name=sub_name,
+                backend_type=backend_obj.name,
+                process_handle=spawn_result.process_handle,
+                result_file=one_shot_result_path,
+                color=parent.color,
+            )
+        )
+        relay_task.add_done_callback(_log_relay_task_exception)
+
+    return {
+        "agent_id": sub_id,
+        "parent": parent_name,
+        "task_id": task_id,
+        "agent_type": agent_type,
+        "status": "running",
+        "backend": backend_obj.name,
+        "supports_native_subagents": backend_obj.supports_subagents,
+    }
+
+
+@mcp.tool(tags={_TAG_TEAMMATE})
+def list_subagents(team_name: str, parent_name: str) -> list[dict]:
+    """List all sub-agents for a specific teammate. Returns sub-agent
+    details including status, type, and process handle.
+    """
+    member, _handle, _bt = _resolve_teammate(team_name, parent_name)
+    if not isinstance(member, TeammateMember):
+        raise ToolError(f"{parent_name!r} is not a teammate")
+    return [
+        sub.model_dump(by_alias=True, exclude_none=True) for sub in member.sub_agents
+    ]
+
+
+@mcp.tool(tags={_TAG_TEAMMATE})
+def stop_subagent(team_name: str, parent_name: str, sub_agent_id: str) -> dict:
+    """Stop a running sub-agent by its agent_id. Kills the process and
+    updates the sub-agent status to 'stopped'.
+    """
+    member, _handle, parent_bt = _resolve_teammate(team_name, parent_name)
+    if not isinstance(member, TeammateMember):
+        raise ToolError(f"{parent_name!r} is not a teammate")
+
+    target_sub = None
+    for sub in member.sub_agents:
+        if sub.agent_id == sub_agent_id:
+            target_sub = sub
+            break
+    if target_sub is None:
+        raise ToolError(
+            f"Sub-agent {sub_agent_id!r} not found under {parent_name!r}"
+        )
+    if target_sub.status != "running":
+        raise ToolError(
+            f"Sub-agent {sub_agent_id!r} is not running (status: {target_sub.status})"
+        )
+
+    # Kill sub-agent process
+    if target_sub.process_handle:
+        bt = target_sub.backend_type or parent_bt
+        try:
+            backend_obj = registry.get(bt)
+            backend_obj.kill(target_sub.process_handle)
+        except (KeyError, Exception):
+            pass
+
+    # Update status in config
+    config = teams.read_config(team_name)
+    for cfg_member in config.members:
+        if isinstance(cfg_member, TeammateMember) and cfg_member.name == parent_name:
+            for sub in cfg_member.sub_agents:
+                if sub.agent_id == sub_agent_id:
+                    sub.status = "stopped"
+                    break
+            break
+    teams.write_config(team_name, config)
+
+    return {
+        "success": True,
+        "message": f"Sub-agent {sub_agent_id} stopped",
+        "parent": parent_name,
+    }
+
+
+async def _relay_subagent_result(
+    team_name: str,
+    parent_name: str,
+    sub_name: str,
+    backend_type: str,
+    process_handle: str,
+    result_file: Path | None,
+    color: str,
+) -> None:
+    """Wait for a one-shot sub-agent to finish and relay output to parent's inbox.
+
+    Similar to _relay_one_shot_result but sends to the parent teammate
+    instead of team-lead, and updates the sub-agent status on completion.
+    """
+    deadline = time.time() + _ONE_SHOT_TIMEOUT_S
+    backend_obj = None
+    text = ""
+
+    try:
+        backend_obj = registry.get(backend_type)
+    except KeyError:
+        logger.warning(
+            "Sub-agent backend not available for result relay: %s", backend_type
+        )
+
+    while time.time() < deadline:
+        if result_file is not None:
+            try:
+                if result_file.exists():
+                    text = result_file.read_text().strip()
+            except Exception:
+                logger.exception("Failed reading sub-agent result file: %s", result_file)
+            if text:
+                break
+
+        if backend_obj is not None:
+            status = backend_obj.health_check(process_handle)
+            if not status.alive:
+                break
+
+        await asyncio.sleep(0.5)
+
+    if not text and result_file is not None:
+        try:
+            if result_file.exists():
+                text = result_file.read_text().strip()
+        except Exception:
+            logger.exception("Failed reading sub-agent result file: %s", result_file)
+
+    if not text and backend_obj is not None:
+        try:
+            captured = backend_obj.capture(process_handle)
+            text = _strip_ansi(captured).strip()
+        except Exception:
+            logger.debug(
+                "Failed to capture sub-agent pane output for %s",
+                sub_name,
+                exc_info=True,
+            )
+
+    if not text and time.time() >= deadline:
+        messaging.send_plain_message(
+            team_name,
+            sub_name,
+            parent_name,
+            f"Sub-agent {sub_name} timed out before producing output.",
+            summary="subagent_timeout",
+            color=color,
+        )
+    else:
+        if not text:
+            text = f"Sub-agent {sub_name} ({backend_type}) finished, but no output was captured."
+
+        if len(text) > _ONE_SHOT_RESULT_MAX_CHARS:
+            text = text[:_ONE_SHOT_RESULT_MAX_CHARS] + "\n\n[truncated]"
+
+        messaging.send_plain_message(
+            team_name,
+            sub_name,
+            parent_name,
+            text,
+            summary="subagent_result",
+            color=color,
+        )
+
+    # Update sub-agent status to completed
+    try:
+        config = teams.read_config(team_name)
+        sub_agent_id = f"{sub_name}@{team_name}"
+        for cfg_member in config.members:
+            if (
+                isinstance(cfg_member, TeammateMember)
+                and cfg_member.name == parent_name
+            ):
+                for sub in cfg_member.sub_agents:
+                    if sub.agent_id == sub_agent_id:
+                        sub.status = "completed"
+                        break
+                break
+        teams.write_config(team_name, config)
+    except Exception:
+        logger.debug("Failed to update sub-agent status", exc_info=True)
+
+    if result_file is not None:
+        try:
+            result_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if backend_obj is not None:
+        try:
+            backend_obj.kill(process_handle)
+        except Exception:
+            pass
 
 
 def _create_one_shot_result_path(team_name: str, agent_name: str) -> Path:

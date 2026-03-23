@@ -208,6 +208,12 @@ class TestBaseBackendIsInteractive:
         assert backend.is_interactive is False
 
 
+class TestBaseBackendSupportsSubagents:
+    def test_defaults_to_false(self):
+        backend = _StubBackend()
+        assert backend.supports_subagents is False
+
+
 class TestBaseBackendRetainPaneAfterExit:
     def test_sets_remain_on_exit_option(self):
         backend, mock_ctrl = _make_backend_with_mock_controller()
